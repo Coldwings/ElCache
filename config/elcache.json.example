@@ -1,0 +1,52 @@
+{
+  "node_name": "",
+  "memory": {
+    "max_size": 1073741824,
+    "arc_ghost_size": 0,
+    "high_watermark": 0.95,
+    "low_watermark": 0.85
+  },
+  "disk": {
+    "path": "/var/cache/elcache",
+    "max_size": 107374182400,
+    "use_direct_io": true,
+    "use_fallocate": true,
+    "high_watermark": 0.90,
+    "low_watermark": 0.80
+  },
+  "network": {
+    "bind_address": "0.0.0.0",
+    "cluster_port": 7890,
+    "http_port": 8080,
+    "sdk_port": 7891,
+    "unix_socket_path": "/var/run/elcache/elcache.sock",
+    "shm_path": "/elcache_shm",
+    "shm_size": 268435456,
+    "max_connections": 10000
+  },
+  "cluster": {
+    "cluster_name": "elcache",
+    "seed_nodes": [],
+    "gossip_interval_ms": 1000,
+    "failure_detection_timeout_ms": 10000,
+    "gossip_fanout": 3,
+    "replication_factor": 2,
+    "prefer_local": true,
+    "virtual_nodes": 150
+  },
+  "pool": {
+    "memory_contribution": 0,
+    "disk_contribution": 0,
+    "accept_remote_reads": true,
+    "accept_remote_writes": true
+  },
+  "performance": {
+    "io_threads": 0,
+    "worker_threads": 0,
+    "max_concurrent_disk_ops": 64,
+    "max_concurrent_network_ops": 256,
+    "prefetch_chunks": 2,
+    "enable_metrics": true,
+    "metrics_interval_s": 60
+  }
+}
