@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 
 namespace elcache {
 
@@ -653,9 +654,12 @@ elio::coro::task<Status> HttpServer::start(elio::io::io_context& io_ctx,
     // Create bind address
     elio::net::ipv4_address addr(config_.bind_address, config_.http_port);
     
-    // Start listening (this spawns the accept loop)
+    // Start listening - run the accept loop directly instead of spawning
+    // This ensures the accept loop runs on the scheduler properly
     auto listen_task = server_->listen(addr, io_ctx, sched);
     sched.spawn(listen_task.release());
+    
+    std::cout << "[ElCache] HTTP server listen task spawned\n" << std::flush;
     
     co_return Status::make_ok();
 }

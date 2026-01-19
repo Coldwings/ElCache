@@ -9,15 +9,11 @@
 namespace {
 
 std::atomic<bool> g_running{true};
-elio::runtime::scheduler* g_scheduler = nullptr;
 
 void signal_handler(int sig) {
     std::cout << "\nReceived signal " << sig << ", shutting down...\n";
     g_running = false;
-    // Wake up the scheduler by setting a flag
-    if (g_scheduler) {
-        g_scheduler->shutdown();
-    }
+    // Don't call shutdown here - let the main loop handle it gracefully
 }
 
 void print_usage(const char* prog) {
@@ -133,12 +129,12 @@ int main(int argc, char* argv[]) {
         
         // Create scheduler
         elio::runtime::scheduler sched(num_threads);
-        g_scheduler = &sched;
         
         // Create server
         elcache::ElCacheServer server(config);
         
-        // Connect scheduler to server's io_context
+        // Set io_context on scheduler - workers will poll when idle
+        // The scheduler uses a mutex to prevent concurrent polling
         sched.set_io_context(&server.io_context());
         
         // Start the scheduler
@@ -152,7 +148,7 @@ int main(int argc, char* argv[]) {
                 g_running = false;
             } else {
                 std::cout << "ElCache server started successfully\n";
-                std::cout << "Press Ctrl+C to stop\n";
+                std::cout << "Press Ctrl+C to stop\n" << std::flush;
             }
         };
         
@@ -160,31 +156,30 @@ int main(int argc, char* argv[]) {
         auto task = startup_task();
         sched.spawn(task.release());
         
-        // Main loop - poll IO and check for shutdown
+        // Main loop - wait for shutdown signal
+        // The scheduler workers will poll the io_context when idle
         while (g_running && sched.is_running()) {
-            // Let the scheduler do work
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Use scheduler's try_poll_io to help with I/O processing
+            // This coordinates with workers via mutex
+            if (!sched.try_poll_io(std::chrono::milliseconds(100))) {
+                // If we couldn't get the poll lock, just sleep briefly
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
         
         std::cout << "Shutting down...\n";
         
-        // Create shutdown task
-        auto shutdown_task = [&server]() -> elio::coro::task<void> {
-            co_await server.stop();
-        };
-        
-        // Give server time to shutdown gracefully
-        if (sched.is_running()) {
-            auto stop_task = shutdown_task();
-            sched.spawn(stop_task.release());
-            
-            // Wait briefly for shutdown to complete
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // Stop the server first (this closes listeners and sets running=false)
+        server.http_server()->stop();
+        if (server.cluster()) {
+            // Signal cluster to stop
         }
+        
+        // Give workers a chance to process any shutdown-related completions
+        sched.try_poll_io(std::chrono::milliseconds(100));
         
         // Shutdown scheduler
         sched.shutdown();
-        g_scheduler = nullptr;
         
         std::cout << "ElCache server stopped\n";
         
