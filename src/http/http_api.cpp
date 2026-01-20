@@ -1,6 +1,7 @@
 #include "elcache/http_api.hpp"
 #include "elcache/cache_coordinator.hpp"
 #include "elcache/cluster.hpp"
+#include "elcache/sparse_cache.hpp"
 #include <sstream>
 #include <algorithm>
 #include <cstring>
@@ -512,6 +513,184 @@ elio::coro::task<HttpResponse> HttpHandler::handle_metrics(const HttpRequest& re
     co_return resp;
 }
 
+// Sparse/Partial Write Handlers
+
+elio::coro::task<HttpResponse> HttpHandler::handle_sparse_create(const HttpRequest& req) {
+    // Extract key from path: /sparse/{key}
+    std::string key = req.path.substr(8);  // Remove "/sparse/"
+    if (key.empty()) {
+        co_return HttpResponse::bad_request("Missing key");
+    }
+    
+    // Get total size from header
+    auto size_header = req.header("X-ElCache-Size");
+    if (size_header.empty()) {
+        co_return HttpResponse::bad_request("X-ElCache-Size header required");
+    }
+    
+    uint64_t total_size;
+    try {
+        total_size = std::stoull(size_header);
+    } catch (...) {
+        co_return HttpResponse::bad_request("Invalid X-ElCache-Size value");
+    }
+    
+    if (total_size == 0) {
+        co_return HttpResponse::bad_request("Size must be greater than 0");
+    }
+    
+    // Create sparse entry
+    bool created = global_sparse_cache().create(key, total_size);
+    
+    if (!created) {
+        HttpResponse resp;
+        resp.status_code = 409;  // Conflict
+        resp.status_text = "Conflict";
+        std::string msg = "Sparse entry already exists";
+        resp.body = ByteBuffer(msg.begin(), msg.end());
+        resp.set_content_type("text/plain");
+        co_return resp;
+    }
+    
+    HttpResponse resp = HttpResponse::created();
+    resp.headers["X-ElCache-Size"] = std::to_string(total_size);
+    co_return resp;
+}
+
+elio::coro::task<HttpResponse> HttpHandler::handle_sparse_write(const HttpRequest& req) {
+    // Extract key from path: /sparse/{key}
+    std::string key = req.path.substr(8);  // Remove "/sparse/"
+    if (key.empty()) {
+        co_return HttpResponse::bad_request("Missing key");
+    }
+    
+    // Parse Content-Range header: "bytes start-end/total" or query param ?offset=
+    uint64_t offset = 0;
+    
+    auto content_range = req.header("Content-Range");
+    if (!content_range.empty()) {
+        // Parse "bytes start-end/total"
+        auto bytes_pos = content_range.find("bytes ");
+        if (bytes_pos != std::string::npos) {
+            auto range_part = content_range.substr(bytes_pos + 6);
+            auto dash_pos = range_part.find('-');
+            if (dash_pos != std::string::npos) {
+                try {
+                    offset = std::stoull(range_part.substr(0, dash_pos));
+                } catch (...) {
+                    co_return HttpResponse::bad_request("Invalid Content-Range");
+                }
+            }
+        }
+    } else {
+        // Try query parameter ?offset=
+        auto offset_pos = req.query.find("offset=");
+        if (offset_pos != std::string::npos) {
+            try {
+                offset = std::stoull(req.query.substr(offset_pos + 7));
+            } catch (...) {
+                co_return HttpResponse::bad_request("Invalid offset parameter");
+            }
+        }
+    }
+    
+    if (req.body.empty()) {
+        co_return HttpResponse::bad_request("Request body is empty");
+    }
+    
+    // Write to sparse entry
+    bool success = global_sparse_cache().write_range(key, offset, req.body.data(), req.body.size());
+    
+    if (!success) {
+        if (!global_sparse_cache().exists(key)) {
+            co_return HttpResponse::not_found("Sparse entry not found");
+        }
+        co_return HttpResponse::bad_request("Invalid range (offset + size exceeds total)");
+    }
+    
+    HttpResponse resp;
+    resp.status_code = 202;  // Accepted
+    resp.status_text = "Accepted";
+    resp.headers["X-ElCache-Completion"] = std::to_string(global_sparse_cache().get_completion(key)) + "%";
+    co_return resp;
+}
+
+elio::coro::task<HttpResponse> HttpHandler::handle_sparse_finalize(const HttpRequest& req) {
+    // Extract key from path: /sparse/{key}/finalize
+    std::string path = req.path;
+    auto finalize_pos = path.rfind("/finalize");
+    if (finalize_pos == std::string::npos) {
+        co_return HttpResponse::bad_request("Invalid path");
+    }
+    
+    std::string key = path.substr(8, finalize_pos - 8);  // Remove "/sparse/" and "/finalize"
+    if (key.empty()) {
+        co_return HttpResponse::bad_request("Missing key");
+    }
+    
+    // Finalize sparse entry
+    std::vector<uint8_t> data;
+    int result = global_sparse_cache().finalize(key, data);
+    
+    if (result == 1) {
+        co_return HttpResponse::not_found("Sparse entry not found");
+    }
+    
+    if (result == 2) {
+        HttpResponse resp;
+        resp.status_code = 409;  // Conflict
+        resp.status_text = "Conflict";
+        std::string msg = "Not all ranges written";
+        resp.body = ByteBuffer(msg.begin(), msg.end());
+        resp.set_content_type("text/plain");
+        resp.headers["X-ElCache-Completion"] = std::to_string(global_sparse_cache().get_completion(key)) + "%";
+        co_return resp;
+    }
+    
+    // Store in main cache
+    WriteOptions opts;
+    auto ttl_header = req.header("X-ElCache-TTL");
+    if (!ttl_header.empty()) {
+        opts.ttl = std::chrono::seconds(std::stoll(ttl_header));
+    }
+    
+    auto status = co_await cache_.put(CacheKey(key), ByteBuffer(data.begin(), data.end()), opts);
+    
+    if (!status) {
+        co_return HttpResponse::internal_error("Failed to store finalized data: " + status.message());
+    }
+    
+    co_return HttpResponse::created();
+}
+
+elio::coro::task<HttpResponse> HttpHandler::handle_sparse_status(const HttpRequest& req) {
+    // Extract key from path: /sparse/{key}
+    std::string key = req.path.substr(8);  // Remove "/sparse/"
+    if (key.empty()) {
+        co_return HttpResponse::bad_request("Missing key");
+    }
+    
+    if (!global_sparse_cache().exists(key)) {
+        co_return HttpResponse::not_found("Sparse entry not found");
+    }
+    
+    uint64_t total_size = global_sparse_cache().get_total_size(key);
+    double completion = global_sparse_cache().get_completion(key);
+    
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"key\": \"" << key << "\",\n";
+    json << "  \"total_size\": " << total_size << ",\n";
+    json << "  \"completion_percent\": " << completion << ",\n";
+    json << "  \"complete\": " << (completion >= 100.0 ? "true" : "false") << "\n";
+    json << "}\n";
+    
+    auto body_str = json.str();
+    HttpResponse resp = HttpResponse::ok(ByteBuffer(body_str.begin(), body_str.end()));
+    resp.set_content_type("application/json");
+    co_return resp;
+}
+
 // Elio handler adapters - wrap internal handlers for Elio's router
 
 elio::coro::task<elio::http::response> HttpHandler::elio_get_handler(elio::http::context& ctx) {
@@ -568,6 +747,30 @@ elio::coro::task<elio::http::response> HttpHandler::elio_metrics_handler(elio::h
     co_return resp.to_elio_response();
 }
 
+elio::coro::task<elio::http::response> HttpHandler::elio_sparse_create_handler(elio::http::context& ctx) {
+    auto req = HttpRequest::from_context(ctx);
+    auto resp = co_await handle_sparse_create(req);
+    co_return resp.to_elio_response();
+}
+
+elio::coro::task<elio::http::response> HttpHandler::elio_sparse_write_handler(elio::http::context& ctx) {
+    auto req = HttpRequest::from_context(ctx);
+    auto resp = co_await handle_sparse_write(req);
+    co_return resp.to_elio_response();
+}
+
+elio::coro::task<elio::http::response> HttpHandler::elio_sparse_finalize_handler(elio::http::context& ctx) {
+    auto req = HttpRequest::from_context(ctx);
+    auto resp = co_await handle_sparse_finalize(req);
+    co_return resp.to_elio_response();
+}
+
+elio::coro::task<elio::http::response> HttpHandler::elio_sparse_status_handler(elio::http::context& ctx) {
+    auto req = HttpRequest::from_context(ctx);
+    auto resp = co_await handle_sparse_status(req);
+    co_return resp.to_elio_response();
+}
+
 elio::http::router HttpHandler::build_router() {
     elio::http::router router;
     
@@ -615,6 +818,40 @@ elio::http::router HttpHandler::build_router() {
     
     router.get("/cluster/nodes", [this](elio::http::context& ctx) {
         return elio_cluster_handler(ctx);
+    });
+    
+    // Sparse/Partial write endpoints
+    // POST /sparse/{key} - Create sparse entry
+    router.post("/sparse/:key", [this](elio::http::context& ctx) {
+        return elio_sparse_create_handler(ctx);
+    });
+    
+    // PATCH /sparse/{key} - Write range to sparse entry
+    router.add_route(elio::http::method::PATCH, "/sparse/:key", [this](elio::http::context& ctx) {
+        return elio_sparse_write_handler(ctx);
+    });
+    
+    // PUT /sparse/{key} - Alternative to PATCH for range write
+    router.put("/sparse/:key", [this](elio::http::context& ctx) {
+        return elio_sparse_write_handler(ctx);
+    });
+    
+    // POST /sparse/{key}/finalize - Finalize sparse entry
+    router.post("/sparse/:key/finalize", [this](elio::http::context& ctx) {
+        return elio_sparse_finalize_handler(ctx);
+    });
+    
+    // GET /sparse/{key} - Get sparse entry status
+    router.get("/sparse/:key", [this](elio::http::context& ctx) {
+        return elio_sparse_status_handler(ctx);
+    });
+    
+    // DELETE /sparse/{key} - Abort sparse write (use sync handler)
+    router.del("/sparse/:key", [](elio::http::context& ctx) -> elio::http::response {
+        auto path = std::string(ctx.req().path());
+        std::string key = path.substr(8);  // Remove "/sparse/"
+        global_sparse_cache().remove(key);
+        return elio::http::response(elio::http::status::no_content);
     });
     
     return router;

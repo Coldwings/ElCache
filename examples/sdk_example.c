@@ -130,6 +130,8 @@ int main(int argc, char* argv[]) {
             if (err == ELCACHE_OK || err == ELCACHE_ERR_PARTIAL) {
                 printf("Read %zu bytes from offset 500\n", len);
             }
+        } else {
+            fprintf(stderr, "1MB put failed: %s (default buffer is 256KB)\n", elcache_error_string(err));
         }
         
         free(large_value);
@@ -146,6 +148,76 @@ int main(int argc, char* argv[]) {
     int exists;
     elcache_client_exists(client, key, strlen(key), &exists);
     printf("Key exists after delete: %s\n", exists ? "yes" : "no");
+    
+    /* Example: Position-based writes for large values
+     * This demonstrates writing a large value in parts, which can be done
+     * from multiple threads in parallel.
+     */
+    printf("\n=== Position-based Write Example ===\n");
+    
+    const char* sparse_key = "large_file";
+    size_t total_size = 1024 * 1024;  /* 1MB total */
+    size_t chunk_size = 200 * 1024;   /* 200KB chunks (leave room for protocol overhead) */
+    
+    printf("Creating sparse entry for %zu bytes...\n", total_size);
+    err = elcache_client_create_sparse(client, sparse_key, strlen(sparse_key), 
+                                        total_size, NULL);
+    if (err != ELCACHE_OK) {
+        fprintf(stderr, "create_sparse failed: %s\n", elcache_error_string(err));
+    } else {
+        printf("Sparse entry created!\n");
+        
+        /* Write in chunks (in real use, these could be parallel from different threads) */
+        char* chunk_data = malloc(chunk_size);
+        if (chunk_data) {
+            int success = 1;
+            for (size_t offset = 0; offset < total_size && success; offset += chunk_size) {
+                size_t write_len = (offset + chunk_size > total_size) ? 
+                                   (total_size - offset) : chunk_size;
+                
+                /* Fill chunk with pattern based on offset */
+                memset(chunk_data, (char)('A' + (offset / chunk_size)), write_len);
+                
+                printf("Writing %zu bytes at offset %zu...\n", write_len, offset);
+                err = elcache_client_write_range(client, sparse_key, strlen(sparse_key),
+                                                  offset, chunk_data, write_len);
+                if (err != ELCACHE_OK) {
+                    fprintf(stderr, "write_range failed: %s\n", elcache_error_string(err));
+                    success = 0;
+                }
+            }
+            free(chunk_data);
+            
+            if (success) {
+                printf("All chunks written, finalizing...\n");
+                err = elcache_client_finalize(client, sparse_key, strlen(sparse_key));
+                if (err == ELCACHE_OK) {
+                    printf("Entry finalized successfully!\n");
+                    
+                    /* Verify we can read it back */
+                    printf("Reading back first 100 bytes...\n");
+                    char verify_buf[100];
+                    size_t read_len;
+                    elcache_get_options_t opts = ELCACHE_GET_OPTIONS_INIT;
+                    opts.offset = 0;
+                    opts.length = 100;
+                    err = elcache_client_get(client, sparse_key, strlen(sparse_key),
+                                             verify_buf, sizeof(verify_buf), &read_len, &opts);
+                    if (err == ELCACHE_OK) {
+                        printf("Read %zu bytes, first char: '%c' (expected 'A')\n", 
+                               read_len, verify_buf[0]);
+                    }
+                    
+                    /* Clean up */
+                    elcache_client_delete(client, sparse_key, strlen(sparse_key));
+                } else if (err == ELCACHE_ERR_PARTIAL) {
+                    fprintf(stderr, "Finalize failed: not all ranges written\n");
+                } else {
+                    fprintf(stderr, "Finalize failed: %s\n", elcache_error_string(err));
+                }
+            }
+        }
+    }
     
     /* Print stats */
     printf("\n");

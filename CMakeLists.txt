@@ -89,11 +89,13 @@ add_library(elcache
     src/cache/memory_cache.cpp
     src/cache/disk_cache.cpp
     src/cache/cache_coordinator.cpp
+    src/cache/sparse_cache.cpp
     src/storage/chunk_store.cpp
     src/storage/disk_store.cpp
     src/network/node.cpp
     src/network/gossip.cpp
     src/network/cluster.cpp
+    src/network/unix_server.cpp
     src/protocol/protocol.cpp
     src/protocol/codec.cpp
     src/http/http_api.cpp

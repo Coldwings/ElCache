@@ -13,6 +13,7 @@
 #include "cluster.hpp"
 #include "protocol.hpp"
 #include "http_api.hpp"
+#include "unix_server.hpp"
 #include "metrics.hpp"
 #include <elio/io/io_context.hpp>
 #include <elio/runtime/scheduler.hpp>
@@ -35,6 +36,7 @@ public:
     CacheCoordinator& cache() { return *coordinator_; }
     Cluster* cluster() { return cluster_.get(); }
     HttpServer* http_server() { return http_server_.get(); }
+    UnixSocketServer* unix_server() { return unix_server_.get(); }
     MetricsCollector& metrics() { return *metrics_collector_; }
     elio::io::io_context& io_context() { return io_ctx_; }
     
@@ -49,6 +51,7 @@ private:
     std::unique_ptr<MetricsCollector> metrics_collector_;
     std::unique_ptr<HttpHandler> http_handler_;
     std::unique_ptr<HttpServer> http_server_;
+    std::unique_ptr<UnixSocketServer> unix_server_;
     
     std::atomic<bool> running_{false};
 };

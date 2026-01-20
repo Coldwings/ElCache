@@ -30,6 +30,13 @@
 #define MSG_DELETE_RESPONSE 0x0105
 #define MSG_CHECK 0x0106
 #define MSG_CHECK_RESPONSE 0x0107
+/* Sparse/partial write operations */
+#define MSG_CREATE_SPARSE 0x0108
+#define MSG_CREATE_SPARSE_RESPONSE 0x0109
+#define MSG_WRITE_RANGE 0x010A
+#define MSG_WRITE_RANGE_RESPONSE 0x010B
+#define MSG_FINALIZE 0x010C
+#define MSG_FINALIZE_RESPONSE 0x010D
 
 /* Default buffer sizes */
 #define DEFAULT_RECV_BUFFER (256 * 1024)
@@ -759,6 +766,234 @@ const char* elcache_error_string(elcache_error_t error) {
 
 void elcache_free(void* ptr) {
     free(ptr);
+}
+
+/*
+ * Position-based write operations
+ */
+
+elcache_error_t elcache_client_create_sparse(elcache_client_t* client,
+                                              const void* key, size_t key_len,
+                                              uint64_t total_size,
+                                              const elcache_put_options_t* options) {
+    if (!client || !key) {
+        return ELCACHE_ERR_INVALID_ARG;
+    }
+    
+    if (key_len > 8192) {
+        set_error(client, "Key too large");
+        return ELCACHE_ERR_KEY_TOO_LARGE;
+    }
+    
+    if (!elcache_client_is_connected(client)) {
+        set_error(client, "Not connected");
+        return ELCACHE_ERR_CONNECTION;
+    }
+    
+    /* Build request: key_len(4) + key + total_size(8) + has_ttl(1) + [ttl(8)] + flags(4) */
+    uint8_t* payload = client->send_buffer + ELCACHE_HEADER_SIZE;
+    size_t payload_len = 0;
+    
+    /* Key */
+    encode_u32(payload + payload_len, (uint32_t)key_len);
+    payload_len += 4;
+    memcpy(payload + payload_len, key, key_len);
+    payload_len += key_len;
+    
+    /* Total size */
+    encode_u64(payload + payload_len, total_size);
+    payload_len += 8;
+    
+    /* TTL */
+    int has_ttl = options && options->ttl_seconds > 0;
+    payload[payload_len++] = has_ttl ? 1 : 0;
+    if (has_ttl) {
+        encode_u64(payload + payload_len, (uint64_t)options->ttl_seconds);
+        payload_len += 8;
+    }
+    
+    /* Flags */
+    uint32_t flags = options ? options->flags : 0;
+    encode_u32(payload + payload_len, flags);
+    payload_len += 4;
+    
+    /* Encode header and send */
+    uint32_t request_id = client->next_request_id++;
+    encode_header(client->send_buffer, MSG_CREATE_SPARSE, (uint32_t)payload_len, request_id);
+    
+    elcache_error_t err = send_all(client, client->send_buffer, ELCACHE_HEADER_SIZE + payload_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Receive response */
+    err = recv_all(client, client->recv_buffer, ELCACHE_HEADER_SIZE);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    uint32_t response_len = decode_u32(client->recv_buffer + 8);
+    err = recv_all(client, client->recv_buffer + ELCACHE_HEADER_SIZE, response_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Parse response */
+    uint8_t* resp = client->recv_buffer + ELCACHE_HEADER_SIZE;
+    uint32_t code = decode_u32(resp);
+    
+    if (code != 0) {
+        set_error(client, "Create sparse failed");
+        return ELCACHE_ERR_INTERNAL;
+    }
+    
+    return ELCACHE_OK;
+}
+
+elcache_error_t elcache_client_write_range(elcache_client_t* client,
+                                            const void* key, size_t key_len,
+                                            uint64_t offset,
+                                            const void* data, size_t data_len) {
+    if (!client || !key || !data) {
+        return ELCACHE_ERR_INVALID_ARG;
+    }
+    
+    if (key_len > 8192) {
+        set_error(client, "Key too large");
+        return ELCACHE_ERR_KEY_TOO_LARGE;
+    }
+    
+    if (!elcache_client_is_connected(client)) {
+        set_error(client, "Not connected");
+        return ELCACHE_ERR_CONNECTION;
+    }
+    
+    /* Check if payload fits in buffer */
+    size_t needed = ELCACHE_HEADER_SIZE + 4 + key_len + 8 + 4 + data_len;
+    if (needed > client->send_buffer_size) {
+        set_error(client, "Data too large for buffer");
+        return ELCACHE_ERR_VALUE_TOO_LARGE;
+    }
+    
+    /* Build request: key_len(4) + key + offset(8) + data_len(4) + data */
+    uint8_t* payload = client->send_buffer + ELCACHE_HEADER_SIZE;
+    size_t payload_len = 0;
+    
+    /* Key */
+    encode_u32(payload + payload_len, (uint32_t)key_len);
+    payload_len += 4;
+    memcpy(payload + payload_len, key, key_len);
+    payload_len += key_len;
+    
+    /* Offset */
+    encode_u64(payload + payload_len, offset);
+    payload_len += 8;
+    
+    /* Data */
+    encode_u32(payload + payload_len, (uint32_t)data_len);
+    payload_len += 4;
+    memcpy(payload + payload_len, data, data_len);
+    payload_len += data_len;
+    
+    /* Encode header and send */
+    uint32_t request_id = client->next_request_id++;
+    encode_header(client->send_buffer, MSG_WRITE_RANGE, (uint32_t)payload_len, request_id);
+    
+    elcache_error_t err = send_all(client, client->send_buffer, ELCACHE_HEADER_SIZE + payload_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Receive response */
+    err = recv_all(client, client->recv_buffer, ELCACHE_HEADER_SIZE);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    uint32_t response_len = decode_u32(client->recv_buffer + 8);
+    err = recv_all(client, client->recv_buffer + ELCACHE_HEADER_SIZE, response_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Parse response */
+    uint8_t* resp = client->recv_buffer + ELCACHE_HEADER_SIZE;
+    uint32_t code = decode_u32(resp);
+    
+    if (code == 1) {
+        set_error(client, "Key not found or not sparse");
+        return ELCACHE_ERR_NOT_FOUND;
+    } else if (code == 2) {
+        set_error(client, "Invalid range");
+        return ELCACHE_ERR_INVALID_ARG;
+    } else if (code != 0) {
+        set_error(client, "Write range failed");
+        return ELCACHE_ERR_INTERNAL;
+    }
+    
+    /* Update stats */
+    client->bytes_written += data_len;
+    
+    return ELCACHE_OK;
+}
+
+elcache_error_t elcache_client_finalize(elcache_client_t* client,
+                                         const void* key, size_t key_len) {
+    if (!client || !key) {
+        return ELCACHE_ERR_INVALID_ARG;
+    }
+    
+    if (!elcache_client_is_connected(client)) {
+        set_error(client, "Not connected");
+        return ELCACHE_ERR_CONNECTION;
+    }
+    
+    /* Build request: key_len(4) + key */
+    uint8_t* payload = client->send_buffer + ELCACHE_HEADER_SIZE;
+    size_t payload_len = 0;
+    
+    encode_u32(payload + payload_len, (uint32_t)key_len);
+    payload_len += 4;
+    memcpy(payload + payload_len, key, key_len);
+    payload_len += key_len;
+    
+    /* Encode header and send */
+    uint32_t request_id = client->next_request_id++;
+    encode_header(client->send_buffer, MSG_FINALIZE, (uint32_t)payload_len, request_id);
+    
+    elcache_error_t err = send_all(client, client->send_buffer, ELCACHE_HEADER_SIZE + payload_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Receive response */
+    err = recv_all(client, client->recv_buffer, ELCACHE_HEADER_SIZE);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    uint32_t response_len = decode_u32(client->recv_buffer + 8);
+    err = recv_all(client, client->recv_buffer + ELCACHE_HEADER_SIZE, response_len);
+    if (err != ELCACHE_OK) {
+        return err;
+    }
+    
+    /* Parse response */
+    uint8_t* resp = client->recv_buffer + ELCACHE_HEADER_SIZE;
+    uint32_t code = decode_u32(resp);
+    
+    if (code == 1) {
+        set_error(client, "Key not found");
+        return ELCACHE_ERR_NOT_FOUND;
+    } else if (code == 2) {
+        set_error(client, "Not all ranges written");
+        return ELCACHE_ERR_PARTIAL;
+    } else if (code != 0) {
+        set_error(client, "Finalize failed");
+        return ELCACHE_ERR_INTERNAL;
+    }
+    
+    return ELCACHE_OK;
 }
 
 /* Streaming operations stubs */

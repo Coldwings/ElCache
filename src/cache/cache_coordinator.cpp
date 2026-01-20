@@ -104,6 +104,7 @@ elio::coro::task<Status> CacheCoordinator::put(
     const WriteOptions& opts)
 {
     Status status = Status::make_ok();
+    bool wrote_to_storage = false;
     
     // Write to memory cache
     if (memory_ && !opts.no_memory) {
@@ -111,6 +112,7 @@ elio::coro::task<Status> CacheCoordinator::put(
         if (!status) {
             co_return status;
         }
+        wrote_to_storage = true;
     }
     
     // Write to disk cache
@@ -119,6 +121,7 @@ elio::coro::task<Status> CacheCoordinator::put(
         if (!status) {
             co_return status;
         }
+        wrote_to_storage = true;
     }
     
     // Replicate to cluster
@@ -136,6 +139,11 @@ elio::coro::task<Status> CacheCoordinator::put(
             // Log failures but don't fail the operation
             (void)rep_status;
         }
+    }
+    
+    // Return error if no storage was available
+    if (!wrote_to_storage) {
+        co_return Status::error(ErrorCode::InternalError, "No storage available");
     }
     
     co_return Status::make_ok();

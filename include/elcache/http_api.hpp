@@ -96,6 +96,12 @@ private:
     elio::coro::task<HttpResponse> handle_head(const HttpRequest& req);
     elio::coro::task<HttpResponse> handle_options(const HttpRequest& req);
     
+    // Sparse/partial write handlers
+    elio::coro::task<HttpResponse> handle_sparse_create(const HttpRequest& req);
+    elio::coro::task<HttpResponse> handle_sparse_write(const HttpRequest& req);
+    elio::coro::task<HttpResponse> handle_sparse_finalize(const HttpRequest& req);
+    elio::coro::task<HttpResponse> handle_sparse_status(const HttpRequest& req);
+    
     // Stats/admin endpoints
     elio::coro::task<HttpResponse> handle_stats(const HttpRequest& req);
     elio::coro::task<HttpResponse> handle_health(const HttpRequest& req);
@@ -112,6 +118,10 @@ private:
     elio::coro::task<elio::http::response> elio_health_handler(elio::http::context& ctx);
     elio::coro::task<elio::http::response> elio_cluster_handler(elio::http::context& ctx);
     elio::coro::task<elio::http::response> elio_metrics_handler(elio::http::context& ctx);
+    elio::coro::task<elio::http::response> elio_sparse_create_handler(elio::http::context& ctx);
+    elio::coro::task<elio::http::response> elio_sparse_write_handler(elio::http::context& ctx);
+    elio::coro::task<elio::http::response> elio_sparse_finalize_handler(elio::http::context& ctx);
+    elio::coro::task<elio::http::response> elio_sparse_status_handler(elio::http::context& ctx);
 };
 
 // HTTP server using Elio's async server
@@ -147,6 +157,13 @@ Endpoints:
   
   GET    /cache/{key}?range=0-1023  - Partial read (alternative to Range header)
   
+  # Sparse/Parallel Write API
+  POST   /sparse/{key}          - Create sparse entry (X-ElCache-Size header required)
+  PATCH  /sparse/{key}          - Write range (Content-Range header required)
+  POST   /sparse/{key}/finalize - Finalize sparse entry
+  GET    /sparse/{key}          - Get sparse entry status
+  DELETE /sparse/{key}          - Abort sparse write
+  
   GET    /stats                 - Cache statistics
   GET    /health                - Health check
   GET    /cluster               - Cluster info
@@ -158,6 +175,7 @@ Headers:
   X-ElCache-No-Memory: true     - Skip memory cache
   X-ElCache-No-Disk: true       - Skip disk cache
   X-ElCache-No-Cluster: true    - Don't replicate
+  X-ElCache-Size: 1048576       - Total size for sparse entry creation
 
 Response Headers:
   X-ElCache-Hit: memory|disk|cluster|miss

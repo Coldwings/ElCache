@@ -110,6 +110,9 @@ elio::coro::task<Status> DiskStore::write_file(
         co_return Status::error(ErrorCode::DiskError, "Failed to open file for writing");
     }
     
+    // Ensure file is readable regardless of umask
+    fchmod(fd, 0644);
+    
     // Pre-allocate if supported
 #ifdef __linux__
     if (config_.use_fallocate) {
