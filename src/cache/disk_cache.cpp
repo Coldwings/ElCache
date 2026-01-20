@@ -49,14 +49,9 @@ elio::coro::task<ByteBuffer> DiskStore::read_file(
     uint64_t offset,
     uint64_t length)
 {
-    int flags = O_RDONLY;
-#ifdef O_DIRECT
-    if (config_.use_direct_io && length >= config_.block_size) {
-        flags |= O_DIRECT;
-    }
-#endif
-    
-    int fd = ::open(path.c_str(), flags);
+    // Note: O_DIRECT requires aligned buffers which we can't guarantee,
+    // so we use regular buffered I/O.
+    int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         co_return ByteBuffer{};
     }
@@ -72,22 +67,19 @@ elio::coro::task<ByteBuffer> DiskStore::read_file(
     ByteBuffer buffer(length);
     size_t total_read = 0;
     
-    // Use Elio async read with offset support
+    // Use synchronous pread for regular files
+    // (epoll backend cannot handle regular files - they don't support polling)
     while (total_read < length) {
-        auto result = co_await elio::io::async_read(
-            io_ctx_, fd, 
-            buffer.data() + total_read, 
-            length - total_read,
-            static_cast<int64_t>(offset + total_read));
-        
-        if (!result.success() || result.result <= 0) {
+        ssize_t n = ::pread(fd, buffer.data() + total_read, 
+                           length - total_read, 
+                           static_cast<off_t>(offset + total_read));
+        if (n <= 0) {
             break;
         }
-        total_read += result.result;
+        total_read += n;
     }
     
-    // Async close
-    co_await elio::io::async_close(io_ctx_, fd);
+    ::close(fd);
     
     buffer.resize(total_read);
     co_return buffer;
@@ -98,16 +90,15 @@ elio::coro::task<Status> DiskStore::write_file(
     ByteView data,
     bool sync)
 {
-    int flags = O_WRONLY | O_CREAT | O_TRUNC;
-#ifdef O_DIRECT
-    if (config_.use_direct_io && data.size() >= config_.block_size) {
-        flags |= O_DIRECT;
-    }
-#endif
+    // Note: O_DIRECT requires aligned buffers which we can't guarantee,
+    // so we don't use it here. Regular buffered I/O is sufficient for
+    // most use cases and the kernel's page cache helps performance.
+    int flags = O_RDWR | O_CREAT | O_TRUNC;
     
     int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
-        co_return Status::error(ErrorCode::DiskError, "Failed to open file for writing");
+        co_return Status::error(ErrorCode::DiskError, 
+            std::string("Failed to open file for writing: ") + strerror(errno));
     }
     
     // Ensure file is readable regardless of umask
@@ -115,33 +106,37 @@ elio::coro::task<Status> DiskStore::write_file(
     
     // Pre-allocate if supported
 #ifdef __linux__
-    if (config_.use_fallocate) {
+    if (config_.use_fallocate && data.size() > 0) {
         fallocate(fd, 0, 0, data.size());
     }
 #endif
     
     size_t total_written = 0;
     
-    // Use Elio async write
+    // Use synchronous pwrite for regular files
+    // (epoll backend cannot handle regular files - they don't support polling)
     while (total_written < data.size()) {
-        auto result = co_await elio::io::async_write(
-            io_ctx_, fd,
-            data.data() + total_written,
-            data.size() - total_written,
-            static_cast<int64_t>(total_written));
-        
-        if (!result.success() || result.result <= 0) {
-            co_await elio::io::async_close(io_ctx_, fd);
-            co_return Status::error(ErrorCode::DiskError, "Write failed");
+        ssize_t n = ::pwrite(fd, data.data() + total_written,
+                            data.size() - total_written,
+                            static_cast<off_t>(total_written));
+        if (n < 0) {
+            int err = errno;
+            ::close(fd);
+            co_return Status::error(ErrorCode::DiskError, 
+                std::string("Write failed: ") + strerror(err));
         }
-        total_written += result.result;
+        if (n == 0) {
+            // Unexpected - pwrite should not return 0 unless count is 0
+            break;
+        }
+        total_written += n;
     }
     
     if (sync) {
-        fsync(fd);  // TODO: Use async fsync when available in Elio
+        fsync(fd);
     }
     
-    co_await elio::io::async_close(io_ctx_, fd);
+    ::close(fd);
     co_return Status::make_ok();
 }
 
