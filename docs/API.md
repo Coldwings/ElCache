@@ -189,6 +189,257 @@ OPTIONS /cache/{key}
 
 ---
 
+## Sparse/Parallel Write Operations
+
+The sparse write API allows uploading large files in parts, potentially from multiple clients in parallel. This is useful for:
+
+- Files larger than available memory
+- Parallel uploads from multiple sources
+- Resumable uploads
+- Assembling data from distributed producers
+
+### Workflow
+
+1. **Create** a sparse entry with the total size
+2. **Write** ranges at specific offsets (can be parallel from multiple clients)
+3. **Finalize** to commit to cache (validates all bytes were written)
+
+### Create Sparse Entry
+
+Create a new sparse entry that will be filled with range writes.
+
+```
+POST /sparse/{key}
+```
+
+**Path Parameters:**
+- `key` - Cache key (max 8KB)
+
+**Headers:**
+| Header | Type | Required | Description |
+|--------|------|----------|-------------|
+| `X-ElCache-Size` | integer | Yes | Total size in bytes |
+| `X-ElCache-TTL` | integer | No | Time-to-live in seconds (applied on finalize) |
+
+**Response:**
+- `201 Created` - Sparse entry created
+- `400 Bad Request` - Missing or invalid X-ElCache-Size
+- `409 Conflict` - Sparse entry already exists for this key
+
+**Example:**
+
+```bash
+# Create a 10MB sparse entry
+curl -X POST http://localhost:8080/sparse/myfile \
+  -H "X-ElCache-Size: 10485760"
+```
+
+---
+
+### Write Range
+
+Write data at a specific byte offset within a sparse entry.
+
+```
+PATCH /sparse/{key}
+PUT /sparse/{key}
+```
+
+**Path Parameters:**
+- `key` - Cache key
+
+**Headers:**
+| Header | Type | Description |
+|--------|------|-------------|
+| `Content-Range` | string | Byte range: `bytes start-end/total` |
+
+**Query Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `offset` | integer | Alternative to Content-Range header |
+
+**Request Body:** Raw binary data for this range
+
+**Response:**
+- `202 Accepted` - Range written successfully
+- `400 Bad Request` - Invalid range (exceeds total size)
+- `404 Not Found` - Sparse entry doesn't exist
+
+**Response Headers:**
+| Header | Description |
+|--------|-------------|
+| `X-ElCache-Completion` | Percentage of bytes written (e.g., "75%") |
+
+**Examples:**
+
+```bash
+# Write using Content-Range header
+curl -X PATCH http://localhost:8080/sparse/myfile \
+  -H "Content-Range: bytes 0-1048575/10485760" \
+  --data-binary @chunk1.bin
+
+# Write using offset query parameter
+curl -X PATCH "http://localhost:8080/sparse/myfile?offset=1048576" \
+  --data-binary @chunk2.bin
+
+# Write using PUT (alternative to PATCH)
+curl -X PUT "http://localhost:8080/sparse/myfile?offset=2097152" \
+  --data-binary @chunk3.bin
+```
+
+---
+
+### Get Sparse Entry Status
+
+Get the current status of a sparse entry.
+
+```
+GET /sparse/{key}
+```
+
+**Path Parameters:**
+- `key` - Cache key
+
+**Response:**
+- `200 OK` - Status returned
+- `404 Not Found` - Sparse entry doesn't exist
+
+**Response Body:**
+```json
+{
+  "key": "myfile",
+  "total_size": 10485760,
+  "completion_percent": 75.5,
+  "complete": false
+}
+```
+
+**Example:**
+
+```bash
+curl http://localhost:8080/sparse/myfile
+```
+
+---
+
+### Finalize Sparse Entry
+
+Finalize a sparse entry, validating all bytes have been written and moving it to the main cache.
+
+```
+POST /sparse/{key}/finalize
+```
+
+**Path Parameters:**
+- `key` - Cache key
+
+**Headers:**
+| Header | Type | Description |
+|--------|------|-------------|
+| `X-ElCache-TTL` | integer | Time-to-live in seconds (optional) |
+
+**Response:**
+- `201 Created` - Entry finalized and available in cache
+- `404 Not Found` - Sparse entry doesn't exist
+- `409 Conflict` - Not all byte ranges have been written
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/sparse/myfile/finalize
+```
+
+---
+
+### Abort Sparse Write
+
+Delete a sparse entry without finalizing (abort the upload).
+
+```
+DELETE /sparse/{key}
+```
+
+**Path Parameters:**
+- `key` - Cache key
+
+**Response:**
+- `204 No Content` - Sparse entry deleted
+
+**Example:**
+
+```bash
+curl -X DELETE http://localhost:8080/sparse/myfile
+```
+
+---
+
+### Complete Sparse Write Example
+
+```bash
+#!/bin/bash
+KEY="largefile"
+TOTAL_SIZE=10485760  # 10MB
+CHUNK_SIZE=2097152   # 2MB
+
+# Step 1: Create sparse entry
+echo "Creating sparse entry..."
+curl -s -X POST "http://localhost:8080/sparse/$KEY" \
+  -H "X-ElCache-Size: $TOTAL_SIZE"
+
+# Step 2: Upload chunks in parallel
+echo "Uploading chunks in parallel..."
+for i in 0 1 2 3 4; do
+  OFFSET=$((i * CHUNK_SIZE))
+  (
+    dd if=/dev/urandom bs=$CHUNK_SIZE count=1 2>/dev/null | \
+    curl -s -X PATCH "http://localhost:8080/sparse/$KEY?offset=$OFFSET" \
+      --data-binary @-
+  ) &
+done
+wait
+
+# Step 3: Check status
+echo "Checking status..."
+curl -s "http://localhost:8080/sparse/$KEY"
+
+# Step 4: Finalize
+echo "Finalizing..."
+curl -s -X POST "http://localhost:8080/sparse/$KEY/finalize"
+
+# Step 5: Verify data is accessible
+echo "Verifying..."
+curl -s -I "http://localhost:8080/cache/$KEY" | grep -E "(X-ElCache|Content-Length)"
+```
+
+### Parallel Upload from Multiple Clients
+
+Multiple clients can write different ranges simultaneously:
+
+```bash
+# Client 1 (writes first quarter)
+curl -X PATCH "http://localhost:8080/sparse/shared-file?offset=0" \
+  --data-binary @part1.bin &
+
+# Client 2 (writes second quarter)
+curl -X PATCH "http://localhost:8080/sparse/shared-file?offset=262144" \
+  --data-binary @part2.bin &
+
+# Client 3 (writes third quarter)
+curl -X PATCH "http://localhost:8080/sparse/shared-file?offset=524288" \
+  --data-binary @part3.bin &
+
+# Client 4 (writes fourth quarter)
+curl -X PATCH "http://localhost:8080/sparse/shared-file?offset=786432" \
+  --data-binary @part4.bin &
+
+wait
+
+# Any client can finalize
+curl -X POST "http://localhost:8080/sparse/shared-file/finalize"
+```
+
+---
+
 ## Admin Endpoints
 
 ### Health Check
@@ -331,7 +582,11 @@ All error responses include a plain text body with the error message.
 |-------|-------|
 | Maximum key size | 8 KB |
 | Maximum value size | 20 TB |
+| Maximum single PUT body | 100 MB |
 | Chunk size | 4 MB |
+| Sparse write chunk size | Unlimited (within total size) |
+
+**Note:** For values larger than 100MB, use the sparse write API which allows uploading in smaller chunks.
 
 ---
 
@@ -358,6 +613,25 @@ curl -H "Range: bytes=0-1048575" \
 # Get next 1MB  
 curl -H "Range: bytes=1048576-2097151" \
   http://localhost:8080/cache/bigfile.bin > part2.bin
+```
+
+### Upload a large file using sparse writes
+
+```bash
+# Create 100MB sparse entry
+curl -X POST http://localhost:8080/sparse/bigfile.bin \
+  -H "X-ElCache-Size: 104857600"
+
+# Upload in 10MB chunks (can be parallelized)
+for i in $(seq 0 9); do
+  OFFSET=$((i * 10485760))
+  dd if=bigfile.bin bs=10485760 skip=$i count=1 2>/dev/null | \
+  curl -X PATCH "http://localhost:8080/sparse/bigfile.bin?offset=$OFFSET" \
+    --data-binary @-
+done
+
+# Finalize
+curl -X POST http://localhost:8080/sparse/bigfile.bin/finalize
 ```
 
 ### Monitor cache performance

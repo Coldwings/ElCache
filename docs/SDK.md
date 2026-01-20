@@ -7,6 +7,7 @@ The ElCache C SDK provides high-performance cache access with zero external depe
 - **Zero dependencies**: Only requires POSIX APIs
 - **Two transport modes**: Unix sockets (reliable) and shared memory (fastest)
 - **Partial read support**: Efficiently read byte ranges of large values
+- **Position-based writes**: Write large values in chunks with parallel support
 - **Streaming API**: Handle values larger than memory
 - **Thread safety**: Each client instance is single-threaded; create one per thread
 
@@ -78,6 +79,34 @@ int main() {
     // Cleanup
     elcache_client_destroy(client);
     return 0;
+}
+```
+
+## Quick Reference: Large File Upload
+
+For values larger than 256KB (the default buffer size), use position-based writes:
+
+```c
+#include <elcache/elcache_sdk.h>
+
+int upload_large_file(elcache_client_t* client,
+                      const char* key,
+                      const void* data,
+                      size_t total_size) {
+    // 1. Create sparse entry
+    elcache_client_create_sparse(client, key, strlen(key), total_size, NULL);
+    
+    // 2. Write in chunks (can be parallel from multiple threads)
+    size_t chunk_size = 200 * 1024;  // 200KB chunks
+    for (size_t offset = 0; offset < total_size; offset += chunk_size) {
+        size_t len = (offset + chunk_size > total_size)
+                     ? (total_size - offset) : chunk_size;
+        elcache_client_write_range(client, key, strlen(key),
+                                   offset, (char*)data + offset, len);
+    }
+    
+    // 3. Finalize
+    return elcache_client_finalize(client, key, strlen(key));
 }
 ```
 
@@ -312,6 +341,239 @@ err = elcache_client_read_range(client, "bigfile", 7,
                                  1000,  // offset
                                  buffer, sizeof(buffer),
                                  &bytes_read);
+```
+
+---
+
+### Position-Based Writes (Sparse/Parallel)
+
+The position-based write API allows you to write large values in parts, potentially from multiple threads in parallel. This is useful for:
+
+- Writing files larger than the SDK buffer size (default 256KB)
+- Parallel uploads from multiple sources
+- Resumable uploads
+- Assembling data from multiple producers
+
+#### Workflow
+
+1. **Create** a sparse entry with total size
+2. **Write** ranges at specific offsets (can be parallel)
+3. **Finalize** to commit to cache (validates all bytes written)
+
+#### elcache_client_create_sparse
+
+```c
+elcache_error_t elcache_client_create_sparse(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len,
+    uint64_t total_size,
+    const elcache_put_options_t* options  // NULL for defaults
+);
+```
+
+Create a sparse entry that will be filled with position-based writes.
+
+**Parameters:**
+- `client` - Client instance
+- `key` - Cache key
+- `key_len` - Key length in bytes
+- `total_size` - Total size of the final value in bytes
+- `options` - Optional put options (TTL, flags, etc.)
+
+**Returns:** 
+- `ELCACHE_OK` - Entry created
+- `ELCACHE_ERR_INVALID_ARG` - Invalid parameters
+- `ELCACHE_ERR_INTERNAL` - Entry already exists
+
+---
+
+#### elcache_client_write_range
+
+```c
+elcache_error_t elcache_client_write_range(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len,
+    uint64_t offset,
+    const void* data,
+    size_t data_len
+);
+```
+
+Write data at a specific offset within a sparse entry.
+
+**Parameters:**
+- `client` - Client instance
+- `key` - Cache key
+- `key_len` - Key length in bytes
+- `offset` - Byte offset where data should be written
+- `data` - Data buffer
+- `data_len` - Length of data to write
+
+**Returns:**
+- `ELCACHE_OK` - Data written successfully
+- `ELCACHE_ERR_NOT_FOUND` - Sparse entry doesn't exist
+- `ELCACHE_ERR_INVALID_ARG` - Range exceeds total size
+- `ELCACHE_ERR_VALUE_TOO_LARGE` - Data too large for buffer
+
+**Note:** Multiple `write_range` calls can overlap or be called in parallel from different threads/connections. Each byte position only needs to be written once.
+
+---
+
+#### elcache_client_finalize
+
+```c
+elcache_error_t elcache_client_finalize(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len
+);
+```
+
+Finalize a sparse entry, validating all bytes have been written and moving it to the main cache.
+
+**Parameters:**
+- `client` - Client instance
+- `key` - Cache key
+- `key_len` - Key length in bytes
+
+**Returns:**
+- `ELCACHE_OK` - Entry finalized and available in cache
+- `ELCACHE_ERR_NOT_FOUND` - Sparse entry doesn't exist
+- `ELCACHE_ERR_PARTIAL` - Not all byte ranges have been written
+
+---
+
+#### Example: Writing a 1MB file in chunks
+
+```c
+#include <elcache/elcache_sdk.h>
+#include <string.h>
+
+int upload_large_file(elcache_client_t* client, 
+                      const char* key,
+                      const uint8_t* data, 
+                      size_t total_size) {
+    // Step 1: Create sparse entry
+    elcache_error_t err = elcache_client_create_sparse(
+        client, key, strlen(key), total_size, NULL);
+    if (err != ELCACHE_OK) {
+        return -1;
+    }
+    
+    // Step 2: Write in 200KB chunks
+    const size_t chunk_size = 200 * 1024;
+    for (size_t offset = 0; offset < total_size; offset += chunk_size) {
+        size_t len = (offset + chunk_size > total_size) 
+                     ? (total_size - offset) 
+                     : chunk_size;
+        
+        err = elcache_client_write_range(
+            client, key, strlen(key), offset, data + offset, len);
+        if (err != ELCACHE_OK) {
+            return -1;
+        }
+    }
+    
+    // Step 3: Finalize
+    err = elcache_client_finalize(client, key, strlen(key));
+    if (err != ELCACHE_OK) {
+        return -1;
+    }
+    
+    return 0;
+}
+```
+
+#### Example: Parallel writes from multiple threads
+
+```c
+#include <elcache/elcache_sdk.h>
+#include <pthread.h>
+
+typedef struct {
+    const char* socket_path;
+    const char* key;
+    const uint8_t* data;
+    size_t offset;
+    size_t length;
+    int success;
+} write_task_t;
+
+void* write_worker(void* arg) {
+    write_task_t* task = (write_task_t*)arg;
+    
+    // Each thread creates its own client connection
+    elcache_client_t* client = elcache_client_create();
+    elcache_client_connect_unix(client, task->socket_path);
+    
+    // Write this thread's chunk
+    elcache_error_t err = elcache_client_write_range(
+        client, task->key, strlen(task->key),
+        task->offset, task->data + task->offset, task->length);
+    
+    task->success = (err == ELCACHE_OK);
+    
+    elcache_client_destroy(client);
+    return NULL;
+}
+
+int parallel_upload(const char* socket_path,
+                    const char* key,
+                    const uint8_t* data,
+                    size_t total_size,
+                    int num_threads) {
+    // Create sparse entry first
+    elcache_client_t* client = elcache_client_create();
+    elcache_client_connect_unix(client, socket_path);
+    
+    elcache_error_t err = elcache_client_create_sparse(
+        client, key, strlen(key), total_size, NULL);
+    if (err != ELCACHE_OK) {
+        elcache_client_destroy(client);
+        return -1;
+    }
+    
+    // Spawn threads for parallel writes
+    pthread_t* threads = malloc(num_threads * sizeof(pthread_t));
+    write_task_t* tasks = malloc(num_threads * sizeof(write_task_t));
+    
+    size_t chunk_size = total_size / num_threads;
+    for (int i = 0; i < num_threads; i++) {
+        tasks[i].socket_path = socket_path;
+        tasks[i].key = key;
+        tasks[i].data = data;
+        tasks[i].offset = i * chunk_size;
+        tasks[i].length = (i == num_threads - 1) 
+                          ? (total_size - tasks[i].offset) 
+                          : chunk_size;
+        tasks[i].success = 0;
+        
+        pthread_create(&threads[i], NULL, write_worker, &tasks[i]);
+    }
+    
+    // Wait for all threads
+    int all_success = 1;
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+        if (!tasks[i].success) all_success = 0;
+    }
+    
+    free(threads);
+    free(tasks);
+    
+    if (!all_success) {
+        elcache_client_destroy(client);
+        return -1;
+    }
+    
+    // Finalize
+    err = elcache_client_finalize(client, key, strlen(key));
+    elcache_client_destroy(client);
+    
+    return (err == ELCACHE_OK) ? 0 : -1;
+}
 ```
 
 ---
@@ -588,3 +850,7 @@ void* worker_thread(void* arg) {
 | Maximum value size | 20 TB |
 | Default timeout | 30 seconds |
 | Default buffer size | 256 KB |
+| Maximum single PUT size | Buffer size (default 256 KB) |
+| Sparse write chunk size | Buffer size (default 256 KB) |
+
+**Note:** For values larger than the buffer size, use the position-based write API (`create_sparse`, `write_range`, `finalize`) which allows uploading in chunks.

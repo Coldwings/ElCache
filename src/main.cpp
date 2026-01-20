@@ -21,6 +21,7 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -c, --config <file>    Configuration file path\n"
               << "  -p, --port <port>      HTTP port (default: 8080)\n"
+              << "  -u, --unix <path>      Unix socket path (default: /var/run/elcache/elcache.sock)\n"
               << "  -m, --memory <size>    Memory cache size in MB (default: 1024)\n"
               << "  -d, --disk <path>      Disk cache directory\n"
               << "  -D, --disk-size <size> Disk cache size in GB (default: 100)\n"
@@ -72,6 +73,9 @@ int main(int argc, char* argv[]) {
         else if ((arg == "-s" || arg == "--seed") && i + 1 < argc) {
             config.cluster.seed_nodes.push_back(argv[++i]);
         }
+        else if ((arg == "-u" || arg == "--unix") && i + 1 < argc) {
+            config.network.unix_socket_path = argv[++i];
+        }
         else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
@@ -108,6 +112,7 @@ int main(int argc, char* argv[]) {
                   << " GB at " << config.disk.path << "\n";
     }
     std::cout << "  HTTP port: " << config.network.http_port << "\n";
+    std::cout << "  Unix socket: " << config.network.unix_socket_path << "\n";
     std::cout << "  Cluster port: " << config.network.cluster_port << "\n";
     
     if (!config.cluster.seed_nodes.empty()) {
@@ -217,6 +222,10 @@ ElCacheServer::ElCacheServer(const Config& config)
     http_handler_ = std::make_unique<HttpHandler>(*coordinator_);
     http_handler_->set_metrics_collector(metrics_collector_.get());
     http_server_ = std::make_unique<HttpServer>(config.network, *http_handler_);
+    
+    // Setup Unix socket server for SDK clients
+    unix_server_ = std::make_unique<UnixSocketServer>(
+        config.network.unix_socket_path, *coordinator_, io_ctx_);
 }
 
 ElCacheServer::~ElCacheServer() = default;
@@ -241,11 +250,19 @@ elio::coro::task<Status> ElCacheServer::start(elio::runtime::scheduler& sched) {
         co_return status;
     }
     
+    // Start Unix socket server for SDK clients
+    auto unix_task = unix_server_->start(sched);
+    sched.spawn(unix_task.release());
+    
     co_return Status::make_ok();
 }
 
 elio::coro::task<void> ElCacheServer::stop() {
     running_ = false;
+    
+    if (unix_server_) {
+        unix_server_->stop();
+    }
     
     co_await http_server_->stop();
     

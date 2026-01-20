@@ -258,6 +258,95 @@ elcache_error_t elcache_client_read_range(
 );
 
 /*
+ * Position-based write operations (for parallel large value writes)
+ * 
+ * These functions allow writing large values in parts from multiple
+ * threads or clients in parallel:
+ * 
+ * 1. Call create_sparse() to allocate space with known total size
+ * 2. Call write_range() from multiple threads to write different parts
+ * 3. Call finalize() when all parts are written to mark entry complete
+ * 
+ * Example:
+ *   // Thread 1: Create sparse entry
+ *   elcache_client_create_sparse(client, key, key_len, total_size, NULL);
+ *   
+ *   // Thread 2 & 3: Write parts in parallel
+ *   elcache_client_write_range(client2, key, key_len, 0, data1, len1);
+ *   elcache_client_write_range(client3, key, key_len, len1, data2, len2);
+ *   
+ *   // After all writes complete:
+ *   elcache_client_finalize(client, key, key_len);
+ */
+
+/* Create a sparse entry for parallel writes
+ * 
+ * Allocates space for a value of known total_size but doesn't write data.
+ * The entry remains incomplete until finalize() is called.
+ * 
+ * Parameters:
+ *   key, key_len: The cache key
+ *   total_size: Total size of the value to be written
+ *   options: Optional put options (TTL, flags, etc.)
+ * 
+ * Returns:
+ *   ELCACHE_OK on success
+ *   ELCACHE_ERR_INVALID_ARG if arguments invalid
+ *   ELCACHE_ERR_CONNECTION if not connected
+ */
+elcache_error_t elcache_client_create_sparse(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len,
+    uint64_t total_size,
+    const elcache_put_options_t* options
+);
+
+/* Write data at a specific offset within a sparse entry
+ * 
+ * Can be called from multiple threads/clients in parallel to write
+ * different parts of the same key. Each write_range call is atomic.
+ * 
+ * Parameters:
+ *   key, key_len: The cache key (must have been created with create_sparse)
+ *   offset: Byte offset within the value to write at
+ *   data: Data to write
+ *   data_len: Length of data to write
+ * 
+ * Returns:
+ *   ELCACHE_OK on success
+ *   ELCACHE_ERR_NOT_FOUND if key doesn't exist or wasn't created as sparse
+ *   ELCACHE_ERR_INVALID_ARG if offset+data_len exceeds total_size
+ */
+elcache_error_t elcache_client_write_range(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len,
+    uint64_t offset,
+    const void* data,
+    size_t data_len
+);
+
+/* Finalize a sparse entry after all parts are written
+ * 
+ * Validates that the entry is complete and marks it as readable.
+ * After finalization, the entry can be read normally with get().
+ * 
+ * Parameters:
+ *   key, key_len: The cache key
+ * 
+ * Returns:
+ *   ELCACHE_OK on success
+ *   ELCACHE_ERR_NOT_FOUND if key doesn't exist
+ *   ELCACHE_ERR_PARTIAL if not all ranges have been written
+ */
+elcache_error_t elcache_client_finalize(
+    elcache_client_t* client,
+    const void* key,
+    size_t key_len
+);
+
+/*
  * Streaming operations (for very large values)
  */
 
